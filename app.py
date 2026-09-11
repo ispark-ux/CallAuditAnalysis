@@ -5,6 +5,7 @@ import tempfile
 import subprocess
 import requests
 import urllib.parse
+import shutil
 import numpy as np
 import soundfile as sf
 import librosa
@@ -15,18 +16,14 @@ from pydantic import BaseModel
 import uvicorn
 import urllib3
 
-# Silence the "InsecureRequestWarning" that verify=False triggers on every call
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="VAD Audio Analysis API", version="1.2")
+app = FastAPI(title="VAD Audio Analysis API", version="1.3")
 
-# Fixed, known location to keep the last converted WAV for manual inspection.
-# NOTE: On Render's ephemeral filesystem this survives only until the next
-# deploy/restart, but it is NOT deleted immediately like a TemporaryDirectory,
-# so you have time to download and listen to it via /debug/last_wav.
 DEBUG_AUDIO_DIR = os.path.join(tempfile.gettempdir(), "vad_debug_audio")
 os.makedirs(DEBUG_AUDIO_DIR, exist_ok=True)
 LAST_WAV_PATH = os.path.join(DEBUG_AUDIO_DIR, "last_converted.wav")
+
 
 # ---------- Pydantic Models ----------
 class AudioAnalysisResponse(BaseModel):
@@ -39,9 +36,9 @@ class AudioAnalysisResponse(BaseModel):
     speech_segments: List[List[float]]
     error: str = ""
 
+
 # ---------- VAD Functions ----------
 def load_silero_vad_model():
-    """Load Silero VAD model using torch.hub with caching."""
     hub_dir = os.path.expanduser("~/.cache/torch/hub")
     try:
         os.makedirs(hub_dir, exist_ok=True)
@@ -64,35 +61,32 @@ def load_silero_vad_model():
         print(f"Error loading VAD from torch.hub: {e}")
         return None, None
 
+
 def normalize_audio(audio: np.ndarray) -> np.ndarray:
-    """Normalize audio to prevent clipping."""
     audio = audio.astype(np.float32)
     max_val = np.max(np.abs(audio))
     if max_val > 1e-6:
         audio = audio / max_val * 0.95
     return audio
 
+
 def process_audio_file(audio_path: str, target_sr: int = 16000):
-    """Load and preprocess audio file."""
     try:
         data, sr = sf.read(audio_path)
-
         if len(data.shape) > 1:
             data = np.mean(data, axis=1)
-
         if sr != target_sr:
             data = librosa.resample(data, orig_sr=sr, target_sr=target_sr)
             sr = target_sr
-
         data = normalize_audio(data)
         return data, sr
     except Exception as e:
         print(f"Error processing audio: {e}")
         return None, None
 
+
 def compute_speech_energy_based(audio: np.ndarray, sr: int, threshold: float = 0.02,
                                 min_speech_duration: float = 0.1):
-    """Fallback VAD using energy-based detection."""
     if len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)
 
@@ -102,8 +96,8 @@ def compute_speech_energy_based(audio: np.ndarray, sr: int, threshold: float = 0
 
     energy = []
     for i in range(0, len(audio) - window_size, hop_size):
-        window = audio[i:i+window_size]
-        energy.append(np.sqrt(np.mean(window**2)))
+        window = audio[i:i + window_size]
+        energy.append(np.sqrt(np.mean(window ** 2)))
     energy = np.array(energy)
 
     is_speech = energy > threshold
@@ -127,9 +121,9 @@ def compute_speech_energy_based(audio: np.ndarray, sr: int, threshold: float = 0
 
     return speech_intervals
 
+
 def calculate_metrics_from_intervals(speech_intervals: List[tuple], total_duration: float,
                                      dead_air_secs: float = 5.0) -> Dict:
-    """Calculate metrics from speech intervals."""
     if not speech_intervals:
         return {
             "talk_time": 0.0,
@@ -177,9 +171,9 @@ def calculate_metrics_from_intervals(speech_intervals: List[tuple], total_durati
         "speech_segments": [(round(s, 2), round(e, 2)) for s, e in merged]
     }
 
+
 def compute_vad_metrics(audio: np.ndarray, sr: int, threshold: float = 0.3,
                         dead_air_secs: float = 5.0) -> Dict:
-    """Compute VAD metrics using Silero VAD with fallback."""
     total_duration = len(audio) / sr
 
     try:
@@ -209,11 +203,8 @@ def compute_vad_metrics(audio: np.ndarray, sr: int, threshold: float = 0.3,
     speech_intervals = compute_speech_energy_based(audio, sr, threshold=0.02)
     return calculate_metrics_from_intervals(speech_intervals, total_duration, dead_air_secs)
 
+
 def convert_audio_to_wav(input_path: str, output_path: str, target_sr: int = 16000) -> tuple:
-    """
-    Convert audio to WAV format using ffmpeg.
-    Returns (success: bool, stderr_output: str) so callers can see WHY it failed.
-    """
     try:
         ffmpeg_cmd = "ffmpeg"
         ff = subprocess.run(
@@ -227,25 +218,41 @@ def convert_audio_to_wav(input_path: str, output_path: str, target_sr: int = 160
     except Exception as e:
         return False, f"FFmpeg conversion error: {e}"
 
+
 def is_url(path: str) -> bool:
-    """Check if the given path is a URL."""
     try:
         parsed = urllib.parse.urlparse(path)
         return parsed.scheme in ('http', 'https')
     except Exception:
         return False
 
-def download_audio_from_url(url: str, timeout: int = 60) -> tuple:
-    """
-    Download audio from URL and save to temporary file.
 
-    Returns:
-        (temp_path or None, error_message or "")
-    """
+def _is_private_ip(hostname: str) -> bool:
+    """Detect LAN / private IPs so we can fail fast with a helpful message."""
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(hostname)
+        return ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        return False
+
+
+def download_audio_from_url(url: str, timeout: int = 60) -> tuple:
     try:
         parsed = urllib.parse.urlparse(url)
         if not parsed.scheme or not parsed.netloc:
             return None, f"Invalid URL: {url}"
+
+        # Fail FAST and with a clear message if the host is a private LAN IP.
+        if _is_private_ip(parsed.hostname or ""):
+            return None, (
+                f"'{parsed.hostname}' is a private/LAN IP address. A cloud-hosted server "
+                f"(Render, AWS, etc.) CANNOT reach private IPs inside your local network. "
+                f"You must either:\n"
+                f"  1) Upload the file directly to POST /analyze_audio_upload, OR\n"
+                f"  2) Expose the file via a public tunnel (Cloudflare Tunnel / ngrok), OR\n"
+                f"  3) Deploy this API on a machine inside the same LAN."
+            )
 
         filename = os.path.basename(parsed.path)
         if not filename or '.' not in filename:
@@ -283,7 +290,6 @@ def download_audio_from_url(url: str, timeout: int = 60) -> tuple:
     except requests.exceptions.Timeout as e:
         return None, f"Timeout connecting to {url}: {e}"
     except requests.exceptions.ConnectionError as e:
-        # This is what a private/unreachable IP (e.g. 192.168.x.x from a cloud host) looks like.
         return None, (
             f"Connection error reaching {url}: {e}. "
             f"If this host is a private/LAN IP (e.g. 192.168.x.x), a cloud-hosted server "
@@ -299,13 +305,8 @@ def download_audio_from_url(url: str, timeout: int = 60) -> tuple:
     except Exception as e:
         return None, f"Unexpected error downloading {url}: {e}"
 
-def get_audio_file_path(audio_path: str) -> tuple:
-    """
-    Get audio file path, handling both local files and URLs.
 
-    Returns:
-        (file_path or None, is_temp: bool, error_message: str)
-    """
+def get_audio_file_path(audio_path: str) -> tuple:
     if is_url(audio_path):
         temp_path, err = download_audio_from_url(audio_path, timeout=60)
         if temp_path is None:
@@ -316,10 +317,10 @@ def get_audio_file_path(audio_path: str) -> tuple:
             return None, False, f"Local file not found: {audio_path}"
         return audio_path, False, ""
 
+
 # ---------- Shared processing logic ----------
 def run_vad_pipeline(local_file_path: str, vad_threshold: float, dead_air_secs: float,
                      sample_rate: int) -> Dict:
-    """Runs conversion + VAD on an already-resolved local file path."""
     result = {
         "success": False,
         "duration": 0.0,
@@ -339,10 +340,7 @@ def run_vad_pipeline(local_file_path: str, vad_threshold: float, dead_air_secs: 
             result["error"] = f"Failed to convert audio to WAV format. ffmpeg said: {ffmpeg_err}"
             return result
 
-        # Copy the converted WAV out of the temp dir so it can be manually
-        # inspected/downloaded via /debug/last_wav before this tmpdir is deleted.
         try:
-            import shutil
             shutil.copyfile(wav_path, LAST_WAV_PATH)
         except Exception as copy_err:
             print(f"Could not copy debug wav: {copy_err}")
@@ -366,6 +364,7 @@ def run_vad_pipeline(local_file_path: str, vad_threshold: float, dead_air_secs: 
 
     return result
 
+
 # ---------- FASTAPI ENDPOINTS ----------
 @app.post("/analyze_audio", response_model=AudioAnalysisResponse)
 async def analyze_audio_endpoint(
@@ -381,24 +380,6 @@ async def analyze_audio_endpoint(
     on a cloud host (e.g. Render) and audio_path is a private LAN address
     (e.g. 192.168.x.x), it will NOT be reachable — use /analyze_audio_upload
     instead, or expose the file via a public URL / tunnel.
-
-    Input:
-        - audio_path: str - Path to audio file on server OR HTTP/HTTPS URL
-        - vad_threshold: float - VAD sensitivity (0.1-0.5, default: 0.3)
-        - dead_air_secs: float - Silence threshold for dead air (default: 5.0)
-        - sample_rate: int - Target sample rate (default: 16000)
-
-    Output:
-        {
-            "success": bool,
-            "duration": float,
-            "talk_time": float,
-            "silence_time": float,
-            "dead_air": float,
-            "longest_silence": float,
-            "speech_segments": [[start, end], ...],
-            "error": str
-        }
     """
     result = {
         "success": False,
@@ -450,15 +431,6 @@ async def analyze_audio_upload_endpoint(
 
     Use this when the audio lives on a private network the server can't reach
     (e.g. a LAN-only IP like 192.168.x.x while this API runs on Render/cloud).
-    Have the machine that CAN see the file read it and POST its bytes here
-    instead of asking this server to fetch a URL.
-
-    Example (from a machine on the same LAN as the file):
-        curl -X POST "https://<your-render-url>/analyze_audio_upload" \\
-             -F "file=@DIALDESK_20260908-103100_919910800705_IDC60782-all.mp3" \\
-             -F "vad_threshold=0.3" \\
-             -F "dead_air_secs=5" \\
-             -F "sample_rate=16000"
     """
     result = {
         "success": False,
@@ -500,18 +472,11 @@ async def health_check():
 
 @app.get("/debug/last_wav")
 async def debug_last_wav():
-    """
-    Download the most recently ffmpeg-converted WAV file, to manually verify
-    that conversion actually worked and the audio sounds correct.
-
-    Usage: hit /analyze_audio or /analyze_audio_upload once first (so a
-    conversion happens), then open this URL in a browser or download it
-    with curl:
-        curl -o last_converted.wav https://<your-render-url>/debug/last_wav
-    Then play last_converted.wav locally to confirm it sounds right.
-    """
     if not os.path.exists(LAST_WAV_PATH):
-        raise HTTPException(status_code=404, detail="No converted WAV available yet. Run /analyze_audio or /analyze_audio_upload first.")
+        raise HTTPException(
+            status_code=404,
+            detail="No converted WAV available yet. Run /analyze_audio or /analyze_audio_upload first."
+        )
     from fastapi.responses import FileResponse
     return FileResponse(LAST_WAV_PATH, media_type="audio/wav", filename="last_converted.wav")
 
@@ -523,10 +488,6 @@ async def analyze_batch_endpoint(
     dead_air_secs: float = 5.0,
     sample_rate: int = 16000
 ):
-    """
-    Analyze multiple audio files in batch (URLs or server-local paths only;
-    for LAN files use /analyze_audio_upload per-file instead).
-    """
     results = []
     for path in audio_paths:
         result = await analyze_audio_endpoint(
