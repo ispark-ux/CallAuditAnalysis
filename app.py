@@ -18,7 +18,15 @@ import urllib3
 # Silence the "InsecureRequestWarning" that verify=False triggers on every call
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="VAD Audio Analysis API", version="1.1")
+app = FastAPI(title="VAD Audio Analysis API", version="1.2")
+
+# Fixed, known location to keep the last converted WAV for manual inspection.
+# NOTE: On Render's ephemeral filesystem this survives only until the next
+# deploy/restart, but it is NOT deleted immediately like a TemporaryDirectory,
+# so you have time to download and listen to it via /debug/last_wav.
+DEBUG_AUDIO_DIR = os.path.join(tempfile.gettempdir(), "vad_debug_audio")
+os.makedirs(DEBUG_AUDIO_DIR, exist_ok=True)
+LAST_WAV_PATH = os.path.join(DEBUG_AUDIO_DIR, "last_converted.wav")
 
 # ---------- Pydantic Models ----------
 class AudioAnalysisResponse(BaseModel):
@@ -331,6 +339,14 @@ def run_vad_pipeline(local_file_path: str, vad_threshold: float, dead_air_secs: 
             result["error"] = f"Failed to convert audio to WAV format. ffmpeg said: {ffmpeg_err}"
             return result
 
+        # Copy the converted WAV out of the temp dir so it can be manually
+        # inspected/downloaded via /debug/last_wav before this tmpdir is deleted.
+        try:
+            import shutil
+            shutil.copyfile(wav_path, LAST_WAV_PATH)
+        except Exception as copy_err:
+            print(f"Could not copy debug wav: {copy_err}")
+
         audio_data, sr = process_audio_file(wav_path, sample_rate)
         if audio_data is None:
             result["error"] = "Failed to load audio data after conversion"
@@ -480,6 +496,24 @@ async def analyze_audio_upload_endpoint(
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "service": "VAD Audio Analysis"}
+
+
+@app.get("/debug/last_wav")
+async def debug_last_wav():
+    """
+    Download the most recently ffmpeg-converted WAV file, to manually verify
+    that conversion actually worked and the audio sounds correct.
+
+    Usage: hit /analyze_audio or /analyze_audio_upload once first (so a
+    conversion happens), then open this URL in a browser or download it
+    with curl:
+        curl -o last_converted.wav https://<your-render-url>/debug/last_wav
+    Then play last_converted.wav locally to confirm it sounds right.
+    """
+    if not os.path.exists(LAST_WAV_PATH):
+        raise HTTPException(status_code=404, detail="No converted WAV available yet. Run /analyze_audio or /analyze_audio_upload first.")
+    from fastapi.responses import FileResponse
+    return FileResponse(LAST_WAV_PATH, media_type="audio/wav", filename="last_converted.wav")
 
 
 @app.post("/analyze_batch")
